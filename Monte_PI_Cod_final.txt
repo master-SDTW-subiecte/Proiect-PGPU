@@ -1,0 +1,243 @@
+%%cu
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+#include <curand_kernel.h>
+#include <iostream>
+#include <stdio.h>
+#include <ctime>
+#define N (1<<22)
+using namespace std;
+clock_t c_start, c_end;
+
+__global__ void GPU_genRandomPoints(float *d_randX, float *d_randY)
+{
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+
+  curandState_t rng;
+	curand_init(clock64(), tid, 0, &rng);
+
+  for (int i = 128 * tid; i < 128 * (tid + 1); i++)
+  {
+      d_randX[i] = curand_uniform(&rng);
+      d_randY[i] = curand_uniform(&rng);
+  }   
+}
+
+__global__ void GPU_naiv(float *d_randX, float *d_randY, int *d_threads_num) 
+{
+	int tid = threadIdx.x + blockIdx.x * blockDim.x;
+	int count = 0;
+ 
+	for (int i = 128 * tid; i < 128 * (tid + 1); i++) 
+		if (d_randX[i]*d_randX[i] + d_randY[i]*d_randY[i] <= 1.0f)  count++;
+	
+	d_threads_num[tid] = count;
+}
+
+__global__ void GPU_sharedMem(float *d_randX, float *d_randY, int *d_blocks_num) 
+{
+	int tid = threadIdx.x + blockIdx.x * blockDim.x;
+	__shared__ int s_data[512];
+	int count = 0;
+
+	for (int i = 128 * tid; i < 128 * (tid + 1); i++) 
+		if (d_randX[i]*d_randX[i] + d_randY[i]*d_randY[i] <= 1.0f) 	count++;
+
+	s_data[threadIdx.x] = count;
+
+	__syncthreads();
+
+	if (threadIdx.x == 0) 
+	{
+		int total = 0;
+		for (int j = 0; j < blockDim.x; j++)
+			total += s_data[j];
+
+	  d_blocks_num[blockIdx.x] = total;
+	}
+}
+
+__global__ void GPU_reduction(int *vec) 
+{
+  __shared__ int s_data[512];
+  unsigned int tid = threadIdx.x;
+  unsigned int i = blockIdx.x*blockDim.x + threadIdx.x;
+  s_data[tid] = vec[i];
+
+  for(unsigned int s = blockDim.x>>1; s>0; s>>=1)
+  {
+    __syncthreads();
+    if(tid < s) s_data[tid] += s_data[tid + s];
+  }
+
+  if (tid == 0) vec[blockIdx.x] = s_data[0];
+}
+
+int main() {
+
+	float* randX = new float[N];
+	float* randY = new float[N];
+	srand(time(NULL));
+
+  //____________________________
+  //generare puncte pe CPU
+
+  c_start = clock();
+	for (int i = 0; i < N; i++) 
+  {
+		randX[i] = float(rand()) / RAND_MAX;
+		randY[i] = float(rand()) / RAND_MAX;
+	}
+  c_end = clock();
+  float t_cpu1 = (float)(c_end - c_start) / CLOCKS_PER_SEC;
+
+
+	//_________________________________
+	//calcul PI pe CPU
+
+	c_start = clock();
+	int c_count = 0;
+
+	for (int i = 0; i < N; i++) 
+		if (randX[i] * randX[i] + randY[i] * randY[i] <= 1.0f)  c_count++;
+	
+	float c_num = c_count * 4.0 / N;
+	c_end = clock();
+  float t_cpu2 = (float)(c_end - c_start) / CLOCKS_PER_SEC;
+
+	cout << "\n CPU " << endl;
+	cout << "PI = " << c_num << endl;
+  cout << "Generarea punctelor pe CPU a durat " << t_cpu1 * 1000 << " ms" << endl;
+	cout << "Calculul lui PI pe CPU a durat " << t_cpu2 * 1000 << " ms" << endl;
+
+
+  //____________________________
+  //generare puncte pe GPU
+
+  cudaEvent_t start, stop;
+	size_t size = N * sizeof(float);
+	float *d_randX;
+	float *d_randY;
+	cudaMalloc((void**)&d_randX, size);
+	cudaMalloc((void**)&d_randY, size);
+
+  int threadsPerBlock = 512;
+	int block_num = N / (128 * threadsPerBlock);
+
+  cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+
+	cudaEventRecord(start, 0);
+  GPU_genRandomPoints <<< block_num, threadsPerBlock >>> (d_randX, d_randY);
+  cudaEventRecord(stop, 0);
+	cudaEventSynchronize(stop);
+
+	float t_gpu1;
+	cudaEventElapsedTime(&t_gpu1, start, stop);
+	cudaEventDestroy(start);
+	cudaEventDestroy(stop);
+
+  cout << "\n GPU" << endl;
+	cout << "Generarea punctelor pe GPU a durat " << t_gpu1 << " ms" << endl;
+
+
+  //_________________________________
+	//PI_GPU_naiv
+  
+  int *d_threads_num;
+	cudaMalloc((void**)&d_threads_num, N / 128 * sizeof(int));
+  int *threads_num = new int[N / 128];
+  int g2_count = 0;
+
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+	cudaEventRecord(start, 0);
+
+	//GPU
+	GPU_naiv <<<block_num, threadsPerBlock >>> (d_randX, d_randY, d_threads_num);
+
+	cudaMemcpy(threads_num, d_threads_num, N / 128 * sizeof(int), cudaMemcpyDeviceToHost);
+
+	for (int i = 0; i < N / 128; i++) {
+		g2_count += threads_num[i];
+	}
+
+	//end cont gpu time
+	cudaEventRecord(stop, 0);
+	cudaEventSynchronize(stop);
+	float t_gpu2;
+	cudaEventElapsedTime(&t_gpu2, start, stop);
+	cudaEventDestroy(start);
+	cudaEventDestroy(stop);
+
+	cout << "\n GPU naiv" << endl;
+	cout << "PI = " << g2_count * 4.0 / N << endl;
+	cout << "Calculul lui PI a durat " << t_gpu2 << " ms" << endl;
+
+
+  //_________________________________
+	//PI_GPU_sharedMem
+
+  int *d_blocks_num;
+  int *blocks_num = new int[block_num];
+	cudaMalloc((void**)&d_blocks_num, 512 * sizeof(int));
+  int g3_count = 0;
+
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+	cudaEventRecord(start, 0);
+
+	//GPU
+	GPU_sharedMem <<<block_num, threadsPerBlock >>> (d_randX, d_randY, d_blocks_num);
+
+	cudaMemcpy(blocks_num, d_blocks_num, block_num * sizeof(int), cudaMemcpyDeviceToHost);
+
+	g3_count = 0;
+	for (int i = 0; i < block_num; i++) {
+		g3_count += blocks_num[i];
+	}
+
+	//end cont gpu time
+	cudaEventRecord(stop, 0);
+	cudaEventSynchronize(stop);
+	float t_gpu3;
+	cudaEventElapsedTime(&t_gpu3, start, stop);
+	cudaEventDestroy(start);
+	cudaEventDestroy(stop);
+
+	cout << "\n GPU sharedMem" << endl;
+	cout << "PI = " << g3_count * 4.0 / N << endl;
+	cout << "Calculul lui PI a durat " << t_gpu3 << " ms" << endl;
+
+
+  //_________________________________
+	//PI_GPU_sharedMem+reduction
+
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+	cudaEventRecord(start, 0);
+
+	//GPU
+  GPU_sharedMem <<<block_num, threadsPerBlock >>> (d_randX, d_randY, d_blocks_num);
+  GPU_reduction <<<block_num, threadsPerBlock >>> (d_blocks_num);
+
+	//pi
+	cudaMemcpy(blocks_num, d_blocks_num, block_num * sizeof(int), cudaMemcpyDeviceToHost);
+
+	//end cont gpu time
+	cudaEventRecord(stop, 0);
+	cudaEventSynchronize(stop);
+	float t_gpu4;
+	cudaEventElapsedTime(&t_gpu4, start, stop);
+	cudaEventDestroy(start);
+	cudaEventDestroy(stop);
+
+	cout << "\n GPU sharedMem+reduction" << endl;
+	cout << "PI = " << blocks_num[0] * 4.0 / N << endl;
+	cout << "Calculul lui PI a durat " << t_gpu4 << " ms" << endl;
+
+	cudaFree(d_randX);
+	cudaFree(d_randY);
+	cudaFree(d_threads_num);
+	cudaFree(d_blocks_num);
+}
